@@ -1,16 +1,22 @@
 //! victus-control — performance mode and max fan for the HP Victus 16-d1xxx (board 8A25).
 
 mod bios;
+mod icon;
+mod tray;
 mod victus;
 
 use std::process::ExitCode;
 use std::time::Duration;
 
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+use windows::core::{HSTRING, w};
+
 use victus::{Mode, State, Victus};
 
 const USAGE: &str = "\
-usage: victus-control <command> [--force]
+usage: victus-control [<command>] [--force]
 
+  (no command)                       run the tray icon
   status                             show mode, max fan, fan speeds, GPU power
   mode quiet|default|performance     set the performance mode
   fan max|auto                       set max fan on / back to AUTO
@@ -23,14 +29,16 @@ enum Command {
     Fan(bool),
 }
 
-fn parse_args(args: &[String]) -> Option<(Command, bool)> {
+/// A `None` command means: run the tray icon.
+fn parse_args(args: &[String]) -> Option<(Option<Command>, bool)> {
     let force = args.iter().any(|a| a == "--force");
     let rest: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--force").collect();
     let cmd = match rest.as_slice() {
-        ["status"] => Command::Status,
-        ["mode", m] => Command::Mode(Mode::parse(m)?),
-        ["fan", f] if f.eq_ignore_ascii_case("max") => Command::Fan(true),
-        ["fan", f] if f.eq_ignore_ascii_case("auto") => Command::Fan(false),
+        [] => None,
+        ["status"] => Some(Command::Status),
+        ["mode", m] => Some(Command::Mode(Mode::parse(m)?)),
+        ["fan", f] if f.eq_ignore_ascii_case("max") => Some(Command::Fan(true)),
+        ["fan", f] if f.eq_ignore_ascii_case("auto") => Some(Command::Fan(false)),
         _ => return None,
     };
     Some((cmd, force))
@@ -84,11 +92,25 @@ fn run(cmd: Command, force: bool) -> Result<ExitCode, victus::Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_tray(force: bool) -> ExitCode {
+    match tray::run(force) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Usually started without a console, so stderr may go nowhere.
+            unsafe { MessageBoxW(None, &HSTRING::from(e), w!("victus-control"), MB_OK | MB_ICONERROR) };
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((cmd, force)) = parse_args(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
+    };
+    let Some(cmd) = cmd else {
+        return run_tray(force);
     };
     match run(cmd, force) {
         Ok(code) => code,

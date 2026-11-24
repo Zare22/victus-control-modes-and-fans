@@ -7,7 +7,7 @@ use std::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::RPC_E_TOO_LATE;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
     CoInitializeSecurity, CoSetProxyBlanket, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
     RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, SAFEARRAY,
 };
@@ -111,11 +111,12 @@ pub struct Bios {
 }
 
 impl Bios {
-    /// Initializes COM on the calling thread (STA).
+    /// Initializes COM on the calling thread as MTA, so BIOS calls block
+    /// instead of dispatching window messages while they wait.
     pub fn connect() -> Result<Self> {
         unsafe {
             // S_FALSE (already initialized) is fine; a different apartment model is not.
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ctx("CoInitializeEx")?;
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().ctx("CoInitializeEx")?;
             if let Err(e) = CoInitializeSecurity(
                 None,
                 -1,

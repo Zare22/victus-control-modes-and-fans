@@ -27,7 +27,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::autostart;
 use crate::config::Config;
-use crate::icon;
+use crate::icon::Icons;
 use crate::log;
 use crate::victus::{self, MaxFan, Mode, State, Victus};
 
@@ -42,6 +42,7 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Re-apply waits a little after resume / plug-in so the BIOS has settled.
 const REAPPLY_TIMER: usize = 2;
 const REAPPLY_DELAY_MS: u32 = 2000;
+const REFRESH_TIMER: usize = 3;
 
 const ID_MODE_FIRST: u32 = 100;
 const ID_MAX_FAN: u32 = 200;
@@ -67,6 +68,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 struct App {
     victus: Victus,
     hwnd: HWND,
+    icons: Icons,
     icon: HICON,
     tip: String,
     verifying: Option<(Mode, Instant)>,
@@ -115,11 +117,12 @@ pub fn run(force: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
-        let icon = icon::create().map_err(|e| e.to_string())?;
+        let icons = Icons::load().map_err(|e| e.to_string())?;
         let mut app = App {
             victus,
             hwnd,
-            icon,
+            icon: icons.for_mode(None),
+            icons,
             tip: String::new(),
             verifying: None,
             reapply_reason: None,
@@ -127,7 +130,9 @@ pub fn run(force: bool) -> Result<(), String> {
             display_on: None,
             autostart: autostart::is_enabled(),
         };
-        app.tip = tooltip(&app.victus.read_state());
+        let state = app.victus.read_state();
+        app.tip = tooltip(&state);
+        app.icon = app.icons.for_mode(current_mode(&state));
         app.add_icon();
         app.reapply("start");
         APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -169,6 +174,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(App::run_scheduled_reapply);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == REFRESH_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), REFRESH_TIMER);
+            }
+            with_app(App::refresh);
+            LRESULT(0)
+        }
         WM_POWERBROADCAST => {
             match wparam.0 as u32 {
                 PBT_APMSUSPEND => log::write("suspend"),
@@ -208,7 +220,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn show_menu(hwnd: HWND, x: i32, y: i32) {
     let Some((state, autostart)) = with_app(|app| {
         let state = app.victus.read_state();
-        app.set_tip(tooltip(&state));
+        app.show(&state);
         (state, app.autostart)
     }) else {
         return;
@@ -283,6 +295,10 @@ fn build_menu(state: &Result<State, victus::Error>, autostart: bool) -> windows:
         AppendMenuW(menu, MF_STRING, ID_EXIT as usize, w!("Exit"))?;
         Ok(menu)
     }
+}
+
+fn current_mode(state: &Result<State, victus::Error>) -> Option<Mode> {
+    state.as_ref().ok().and_then(State::mode)
 }
 
 fn mode_name(s: &State) -> &'static str {
@@ -370,22 +386,27 @@ impl App {
         }
     }
 
-    fn set_tip(&mut self, tip: String) {
-        if tip == self.tip {
+    /// Updates the icon and tooltip to match `state`.
+    fn show(&mut self, state: &Result<State, victus::Error>) {
+        let tip = tooltip(state);
+        let icon = self.icons.for_mode(current_mode(state));
+        if tip == self.tip && icon == self.icon {
             return;
         }
         self.tip = tip;
+        self.icon = icon;
         let mut d = self.data();
-        d.uFlags = NIF_TIP | NIF_SHOWTIP;
+        d.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        d.hIcon = self.icon;
         copy_wide(&mut d.szTip, &self.tip);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
         }
     }
 
-    fn refresh_tip(&mut self) {
+    fn refresh(&mut self) {
         let state = self.victus.read_state();
-        self.set_tip(tooltip(&state));
+        self.show(&state);
     }
 
     fn notify(&self, flags: NOTIFY_ICON_INFOTIP_FLAGS, title: &str, text: &str) {
@@ -420,7 +441,7 @@ impl App {
         if self.apply_max_fan(on) {
             self.remember(|cfg| cfg.max_fan = Some(on));
         }
-        self.refresh_tip();
+        self.refresh();
     }
 
     /// Starts the read-back check on success; notifies on failure.
@@ -428,7 +449,7 @@ impl App {
         if let Err(e) = self.victus.set_mode(mode) {
             log::write(&format!("set {mode} failed: {e}"));
             self.notify(NIIF_ERROR, &format!("Couldn't set {mode}"), &e.to_string());
-            self.refresh_tip();
+            self.refresh();
             return false;
         }
         self.verifying = Some((mode, Instant::now()));
@@ -466,7 +487,7 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), VERIFY_TIMER);
         }
-        self.refresh_tip();
+        self.refresh();
     }
 
     fn power_source_changed(&mut self, on_ac: bool) {
@@ -477,6 +498,9 @@ impl App {
         log::write(&format!("power source: {}", power_name(Some(on_ac))));
         if on_ac {
             self.schedule_reapply("AC plug-in");
+        } else {
+            // The BIOS switches to Default shortly after unplugging.
+            unsafe { SetTimer(Some(self.hwnd), REFRESH_TIMER, REAPPLY_DELAY_MS, None) };
         }
     }
 
@@ -565,7 +589,7 @@ impl App {
             state.indicator,
             state.max_fan
         ));
-        self.refresh_tip();
+        self.refresh();
     }
 }
 

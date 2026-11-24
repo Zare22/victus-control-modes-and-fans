@@ -2,8 +2,12 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{
+    GetSystemPowerStatus, POWERBROADCAST_SETTING, RegisterPowerSettingNotification, SYSTEM_POWER_STATUS,
+};
+use windows::Win32::System::SystemServices::{GUID_ACDC_POWER_SOURCE, GUID_CONSOLE_DISPLAY_STATE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_WARNING, NIM_ADD,
@@ -11,17 +15,19 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuRadioItem, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, HMENU, KillTimer,
-    MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER,
-    WNDCLASSW,
+    AppendMenuW, CheckMenuRadioItem, CreatePopupMenu, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, HMENU,
+    KillTimer, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
+use crate::config::Config;
 use crate::icon;
+use crate::log;
 use crate::victus::{self, MaxFan, Mode, State, Victus};
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -31,6 +37,10 @@ const TRAY_ID: u32 = 1;
 const VERIFY_TIMER: usize = 1;
 const VERIFY_POLL_MS: u32 = 250;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Re-apply waits a little after resume / plug-in so the BIOS has settled.
+const REAPPLY_TIMER: usize = 2;
+const REAPPLY_DELAY_MS: u32 = 2000;
 
 const ID_MODE_FIRST: u32 = 100;
 const ID_MAX_FAN: u32 = 200;
@@ -58,6 +68,9 @@ struct App {
     icon: HICON,
     tip: String,
     verifying: Option<(Mode, Instant)>,
+    reapply_reason: Option<&'static str>,
+    on_ac: Option<bool>,
+    display_on: Option<bool>,
 }
 
 /// Returns once the user picks Exit. A second instance returns immediately.
@@ -100,10 +113,28 @@ pub fn run(force: bool) -> Result<(), String> {
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let icon = icon::create().map_err(|e| e.to_string())?;
-        let mut app = App { victus, hwnd, icon, tip: String::new(), verifying: None };
+        let mut app = App {
+            victus,
+            hwnd,
+            icon,
+            tip: String::new(),
+            verifying: None,
+            reapply_reason: None,
+            on_ac: on_ac_power(),
+            display_on: None,
+        };
         app.tip = tooltip(&app.victus.read_state());
         app.add_icon();
+        app.reapply("start");
         APP.with(|cell| *cell.borrow_mut() = Some(app));
+
+        // This laptop only has Modern Standby, which usually sends no resume
+        // event; the display coming back on is the reliable wake signal.
+        for (guid, what) in [(GUID_ACDC_POWER_SOURCE, "power source"), (GUID_CONSOLE_DISPLAY_STATE, "display state")] {
+            if let Err(e) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &guid, DEVICE_NOTIFY_WINDOW_HANDLE) {
+                log::write(&format!("can't watch the {what}: {e}"));
+            }
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -129,6 +160,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == VERIFY_TIMER => {
             with_app(App::check_mode_applied);
             LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == REAPPLY_TIMER => {
+            with_app(App::run_scheduled_reapply);
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            match wparam.0 as u32 {
+                PBT_APMSUSPEND => log::write("suspend"),
+                PBT_APMRESUMEAUTOMATIC => {
+                    with_app(|app| app.schedule_reapply("resume"));
+                }
+                PBT_POWERSETTINGCHANGE => {
+                    let setting = unsafe { &*(lparam.0 as *const POWERBROADCAST_SETTING) };
+                    if setting.DataLength >= 4 {
+                        let value = unsafe { std::ptr::read_unaligned(setting.Data.as_ptr().cast::<u32>()) };
+                        if setting.PowerSetting == GUID_ACDC_POWER_SOURCE {
+                            // 0 = AC, 1 = battery, 2 = short-term source (UPS).
+                            with_app(|app| app.power_source_changed(value == 0));
+                        } else if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
+                            // 0 = off, 1 = on, 2 = dimmed.
+                            with_app(|app| app.display_changed(value != 0));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(1)
         }
         WM_DESTROY => {
             with_app(|app| app.remove_icon());
@@ -171,12 +229,12 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
         },
         ID_MAX_FAN => {
             let on = current.is_none_or(|s| s.max_fan != MaxFan::Max);
-            with_app(|app| app.set_max_fan(on));
+            with_app(|app| app.choose_max_fan(on));
         }
         id if (ID_MODE_FIRST..ID_MODE_FIRST + Mode::ALL.len() as u32).contains(&id) => {
             let mode = Mode::ALL[(id - ID_MODE_FIRST) as usize];
             if current.and_then(State::mode) != Some(mode) {
-                with_app(|app| app.set_mode(mode));
+                with_app(|app| app.choose_mode(mode));
             }
         }
         _ => {}
@@ -188,8 +246,14 @@ fn build_menu(state: &Result<State, victus::Error>) -> windows::core::Result<HME
         let menu = CreatePopupMenu()?;
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(status_line(state)))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
-        for (i, mode) in Mode::ALL.iter().enumerate() {
-            AppendMenuW(menu, MF_STRING, (ID_MODE_FIRST + i as u32) as usize, &HSTRING::from(mode.name()))?;
+        let battery = on_battery();
+        for (i, &mode) in Mode::ALL.iter().enumerate() {
+            let id = (ID_MODE_FIRST + i as u32) as usize;
+            if mode == Mode::Performance && battery {
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, id, w!("Performance (needs charger)"))?;
+            } else {
+                AppendMenuW(menu, MF_STRING, id, &HSTRING::from(mode.name()))?;
+            }
         }
         if let Ok(s) = state
             && let Some(i) = s.mode().and_then(|m| Mode::ALL.iter().position(|&x| x == m))
@@ -222,6 +286,33 @@ fn tooltip(state: &Result<State, victus::Error>) -> String {
     match state {
         Ok(s) => format!("Victus: {} · fan {}", mode_name(s), s.max_fan),
         Err(_) => "Victus: can't read BIOS".to_string(),
+    }
+}
+
+fn fan_name(on: bool) -> &'static str {
+    if on { "max fan" } else { "fan AUTO" }
+}
+
+fn on_ac_power() -> Option<bool> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status) }.ok()?;
+    match status.ACLineStatus {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// On battery the BIOS forces Default and silently ignores a Performance SET.
+fn on_battery() -> bool {
+    on_ac_power() == Some(false)
+}
+
+fn power_name(on_ac: Option<bool>) -> &'static str {
+    match on_ac {
+        Some(true) => "AC",
+        Some(false) => "battery",
+        None => "unknown power",
     }
 }
 
@@ -294,14 +385,50 @@ impl App {
         }
     }
 
-    fn set_mode(&mut self, mode: Mode) {
+    fn remember(&self, update: impl FnOnce(&mut Config)) {
+        let mut cfg = Config::load();
+        update(&mut cfg);
+        if let Err(e) = cfg.save() {
+            log::write(&format!("can't save config: {e}"));
+            self.notify(NIIF_WARNING, "Couldn't save the setting", &e.to_string());
+        }
+    }
+
+    fn choose_mode(&mut self, mode: Mode) {
+        log::write(&format!("menu: {mode}"));
+        if self.apply_mode(mode) {
+            self.remember(|cfg| cfg.mode = Some(mode));
+        }
+    }
+
+    fn choose_max_fan(&mut self, on: bool) {
+        log::write(&format!("menu: {}", fan_name(on)));
+        if self.apply_max_fan(on) {
+            self.remember(|cfg| cfg.max_fan = Some(on));
+        }
+        self.refresh_tip();
+    }
+
+    /// Starts the read-back check on success; notifies on failure.
+    fn apply_mode(&mut self, mode: Mode) -> bool {
         if let Err(e) = self.victus.set_mode(mode) {
+            log::write(&format!("set {mode} failed: {e}"));
             self.notify(NIIF_ERROR, &format!("Couldn't set {mode}"), &e.to_string());
             self.refresh_tip();
-            return;
+            return false;
         }
         self.verifying = Some((mode, Instant::now()));
         unsafe { SetTimer(Some(self.hwnd), VERIFY_TIMER, VERIFY_POLL_MS, None) };
+        true
+    }
+
+    fn apply_max_fan(&mut self, on: bool) -> bool {
+        if let Err(e) = self.victus.set_max_fan(on) {
+            log::write(&format!("set {} failed: {e}", fan_name(on)));
+            self.notify(NIIF_ERROR, &format!("Couldn't set {}", fan_name(on)), &e.to_string());
+            return false;
+        }
+        true
     }
 
     /// Polled after a mode SET until the BIOS mode indicator shows the new mode.
@@ -317,6 +444,7 @@ impl App {
                     Ok(None) => "an unknown mode".to_string(),
                     Err(e) => format!("an error ({e})"),
                 };
+                log::write(&format!("{mode} not confirmed after 3 s: BIOS reports {now}"));
                 self.notify(NIIF_WARNING, &format!("{mode} not confirmed"), &format!("The BIOS still reports {now}."));
             }
         }
@@ -327,11 +455,88 @@ impl App {
         self.refresh_tip();
     }
 
-    fn set_max_fan(&mut self, on: bool) {
-        if let Err(e) = self.victus.set_max_fan(on) {
-            let what = if on { "max fan" } else { "fan AUTO" };
-            self.notify(NIIF_ERROR, &format!("Couldn't set {what}"), &e.to_string());
+    fn power_source_changed(&mut self, on_ac: bool) {
+        let was = self.on_ac.replace(on_ac);
+        if was == Some(on_ac) {
+            return;
         }
+        log::write(&format!("power source: {}", power_name(Some(on_ac))));
+        if on_ac {
+            self.schedule_reapply("AC plug-in");
+        }
+    }
+
+    /// The first notification only reports the current state.
+    fn display_changed(&mut self, on: bool) {
+        let was = self.display_on.replace(on);
+        if was.is_none() || was == Some(on) {
+            return;
+        }
+        log::write(if on { "display on" } else { "display off" });
+        if on {
+            self.schedule_reapply("display on");
+        }
+    }
+
+    fn schedule_reapply(&mut self, reason: &'static str) {
+        self.reapply_reason = Some(reason);
+        unsafe { SetTimer(Some(self.hwnd), REAPPLY_TIMER, REAPPLY_DELAY_MS, None) };
+    }
+
+    fn run_scheduled_reapply(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), REAPPLY_TIMER);
+        }
+        if let Some(reason) = self.reapply_reason.take() {
+            self.reapply(reason);
+        }
+    }
+
+    /// Sets whatever differs between the BIOS and the remembered setting.
+    fn reapply(&mut self, reason: &str) {
+        let cfg = Config::load();
+        let power = power_name(on_ac_power());
+        let state = match self.victus.read_state() {
+            Ok(s) => s,
+            Err(e) => {
+                log::write(&format!("{reason} ({power}): can't read BIOS: {e}"));
+                self.notify(NIIF_ERROR, "Couldn't re-apply the setting", &e.to_string());
+                return;
+            }
+        };
+        let mut changes = Vec::new();
+        let mut note = "";
+        if let Some(mode) = cfg.mode
+            && state.mode() != Some(mode)
+        {
+            if mode == Mode::Performance && on_battery() {
+                note = " (Performance waits for AC)";
+            } else {
+                changes.push(mode.name());
+                self.apply_mode(mode);
+            }
+        }
+        if let Some(on) = cfg.max_fan
+            && on != (state.max_fan == MaxFan::Max)
+        {
+            changes.push(fan_name(on));
+            self.apply_max_fan(on);
+        }
+        let remembered = match (cfg.mode, cfg.max_fan) {
+            (None, None) => "nothing".to_string(),
+            (m, f) => format!(
+                "{} / {}",
+                m.map_or("-", Mode::name),
+                f.map_or("-", fan_name)
+            ),
+        };
+        let action = if changes.is_empty() { "no change".to_string() } else { format!("set {}", changes.join(", ")) };
+        log::write(&format!(
+            "{reason} ({power}): BIOS {} (indicator {}) / fan {}, remembered {remembered}: {action}{note}",
+            mode_name(&state),
+            state.indicator,
+            state.max_fan
+        ));
         self.refresh_tip();
     }
 }

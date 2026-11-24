@@ -1,7 +1,9 @@
 //! victus-control — performance mode and max fan for the HP Victus 16-d1xxx (board 8A25).
 
 mod bios;
+mod config;
 mod icon;
+mod log;
 mod tray;
 mod victus;
 
@@ -77,6 +79,8 @@ fn run(cmd: Command, force: bool) -> Result<ExitCode, victus::Error> {
         }
         Command::Mode(mode) => {
             v.set_mode(mode)?;
+            log::write(&format!("cli: {mode}"));
+            remember(|cfg| cfg.mode = Some(mode));
             let ok = v.wait_for_mode(mode, Duration::from_secs(3))?;
             print_state(&v, &v.read_state()?);
             if !ok {
@@ -86,10 +90,20 @@ fn run(cmd: Command, force: bool) -> Result<ExitCode, victus::Error> {
         }
         Command::Fan(on) => {
             v.set_max_fan(on)?;
+            log::write(&format!("cli: {}", if on { "max fan" } else { "fan AUTO" }));
+            remember(|cfg| cfg.max_fan = Some(on));
             print_state(&v, &v.read_state()?);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn remember(update: impl FnOnce(&mut config::Config)) {
+    let mut cfg = config::Config::load();
+    update(&mut cfg);
+    if let Err(e) = cfg.save() {
+        eprintln!("warning: couldn't save the setting: {e}");
+    }
 }
 
 fn run_tray(force: bool) -> ExitCode {

@@ -1,5 +1,6 @@
 //! victus-control — performance mode and max fan for the HP Victus 16-d1xxx (board 8A25).
 
+mod autostart;
 mod bios;
 mod config;
 mod icon;
@@ -22,8 +23,17 @@ usage: victus-control [<command>] [--force]
   status                             show mode, max fan, fan speeds, GPU power
   mode quiet|default|performance     set the performance mode
   fan max|auto                       set max fan on / back to AUTO
+  --install                          copy to Program Files and start at logon
+  --uninstall                        remove the logon task and Program Files copy
 
   --force   allow SET requests on boards other than 8A25 (unverified!)";
+
+enum Action {
+    Tray,
+    Bios(Command),
+    Install,
+    Uninstall,
+}
 
 enum Command {
     Status,
@@ -31,19 +41,20 @@ enum Command {
     Fan(bool),
 }
 
-/// A `None` command means: run the tray icon.
-fn parse_args(args: &[String]) -> Option<(Option<Command>, bool)> {
+fn parse_args(args: &[String]) -> Option<(Action, bool)> {
     let force = args.iter().any(|a| a == "--force");
     let rest: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--force").collect();
-    let cmd = match rest.as_slice() {
-        [] => None,
-        ["status"] => Some(Command::Status),
-        ["mode", m] => Some(Command::Mode(Mode::parse(m)?)),
-        ["fan", f] if f.eq_ignore_ascii_case("max") => Some(Command::Fan(true)),
-        ["fan", f] if f.eq_ignore_ascii_case("auto") => Some(Command::Fan(false)),
+    let action = match rest.as_slice() {
+        [] => Action::Tray,
+        ["status"] => Action::Bios(Command::Status),
+        ["mode", m] => Action::Bios(Command::Mode(Mode::parse(m)?)),
+        ["fan", f] if f.eq_ignore_ascii_case("max") => Action::Bios(Command::Fan(true)),
+        ["fan", f] if f.eq_ignore_ascii_case("auto") => Action::Bios(Command::Fan(false)),
+        ["--install"] => Action::Install,
+        ["--uninstall"] => Action::Uninstall,
         _ => return None,
     };
-    Some((cmd, force))
+    Some((action, force))
 }
 
 fn print_state(v: &Victus, s: &State) {
@@ -117,16 +128,40 @@ fn run_tray(force: bool) -> ExitCode {
     }
 }
 
+fn install() -> Result<(), String> {
+    autostart::install()?;
+    println!("Installed to {}", autostart::installed_exe().display());
+    println!("Starts at logon (Task Scheduler task \"victus-control\"); the tray is running now.");
+    Ok(())
+}
+
+fn uninstall() -> Result<(), String> {
+    let removed_now = autostart::uninstall()?;
+    println!("Removed the logon task.");
+    if removed_now {
+        println!("Removed {}", autostart::install_dir().display());
+    } else {
+        println!("{} is still in use; it will be removed at the next restart.", autostart::install_dir().display());
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        println!("Your setting stays in {}", std::path::Path::new(&appdata).join("victus-control").display());
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some((cmd, force)) = parse_args(&args) else {
+    let Some((action, force)) = parse_args(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let Some(cmd) = cmd else {
-        return run_tray(force);
+    let result = match action {
+        Action::Tray => return run_tray(force),
+        Action::Bios(cmd) => run(cmd, force).map_err(|e| e.to_string()),
+        Action::Install => install().map(|()| ExitCode::SUCCESS),
+        Action::Uninstall => uninstall().map(|()| ExitCode::SUCCESS),
     };
-    match run(cmd, force) {
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");

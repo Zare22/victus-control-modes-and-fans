@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
+use crate::autostart;
 use crate::config::Config;
 use crate::icon;
 use crate::log;
@@ -44,6 +45,7 @@ const REAPPLY_DELAY_MS: u32 = 2000;
 
 const ID_MODE_FIRST: u32 = 100;
 const ID_MAX_FAN: u32 = 200;
+const ID_AUTOSTART: u32 = 250;
 const ID_EXIT: u32 = 300;
 
 /// Explorer broadcasts this after it restarts; the icon has to be added again.
@@ -71,6 +73,7 @@ struct App {
     reapply_reason: Option<&'static str>,
     on_ac: Option<bool>,
     display_on: Option<bool>,
+    autostart: bool,
 }
 
 /// Returns once the user picks Exit. A second instance returns immediately.
@@ -122,6 +125,7 @@ pub fn run(force: bool) -> Result<(), String> {
             reapply_reason: None,
             on_ac: on_ac_power(),
             display_on: None,
+            autostart: autostart::is_enabled(),
         };
         app.tip = tooltip(&app.victus.read_state());
         app.add_icon();
@@ -202,14 +206,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 fn show_menu(hwnd: HWND, x: i32, y: i32) {
-    let Some(state) = with_app(|app| {
+    let Some((state, autostart)) = with_app(|app| {
         let state = app.victus.read_state();
         app.set_tip(tooltip(&state));
-        state
+        (state, app.autostart)
     }) else {
         return;
     };
-    let Ok(menu) = build_menu(&state) else { return };
+    let Ok(menu) = build_menu(&state, autostart) else { return };
 
     // The menu must not be open while `APP` is borrowed: its modal loop
     // dispatches messages back into `wndproc`.
@@ -227,6 +231,9 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
+        ID_AUTOSTART => {
+            with_app(App::toggle_autostart);
+        }
         ID_MAX_FAN => {
             let on = current.is_none_or(|s| s.max_fan != MaxFan::Max);
             with_app(|app| app.choose_max_fan(on));
@@ -241,7 +248,7 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
     }
 }
 
-fn build_menu(state: &Result<State, victus::Error>) -> windows::core::Result<HMENU> {
+fn build_menu(state: &Result<State, victus::Error>, autostart: bool) -> windows::core::Result<HMENU> {
     unsafe {
         let menu = CreatePopupMenu()?;
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(status_line(state)))?;
@@ -266,6 +273,13 @@ fn build_menu(state: &Result<State, victus::Error>) -> windows::core::Result<HME
         let check = if max_on { MF_CHECKED } else { MF_UNCHECKED };
         AppendMenuW(menu, MF_STRING | check, ID_MAX_FAN as usize, w!("Max fan"))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        if autostart || autostart::running_installed() {
+            let check = if autostart { MF_CHECKED } else { MF_UNCHECKED };
+            AppendMenuW(menu, MF_STRING | check, ID_AUTOSTART as usize, w!("Start with Windows"))?;
+        } else {
+            let label = w!("Start with Windows (run --install)");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_AUTOSTART as usize, label)?;
+        }
         AppendMenuW(menu, MF_STRING, ID_EXIT as usize, w!("Exit"))?;
         Ok(menu)
     }
@@ -463,6 +477,20 @@ impl App {
         log::write(&format!("power source: {}", power_name(Some(on_ac))));
         if on_ac {
             self.schedule_reapply("AC plug-in");
+        }
+    }
+
+    fn toggle_autostart(&mut self) {
+        let result = if self.autostart { autostart::disable() } else { autostart::enable() };
+        match result {
+            Ok(()) => {
+                self.autostart = !self.autostart;
+                log::write(if self.autostart { "menu: start with Windows on" } else { "menu: start with Windows off" });
+            }
+            Err(e) => {
+                log::write(&format!("start with Windows: {e}"));
+                self.notify(NIIF_ERROR, "Couldn't change Start with Windows", &e);
+            }
         }
     }
 

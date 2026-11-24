@@ -1,8 +1,6 @@
 //! Raw transport to the HP BIOS WMI interface (`root\wmi` : `hpqBIntM`).
 //!
-//! This module only knows how to send *a* request; it doesn't know which
-//! requests are safe. Only `victus.rs` calls it, through typed requests
-//! limited to the list in docs/PLAN.md §3.2.
+//! Sends any request it is given; `victus` decides which requests are allowed.
 
 use std::fmt;
 use std::mem::ManuallyDrop;
@@ -29,14 +27,12 @@ use windows::Win32::System::Wmi::{
 };
 use windows::core::{BSTR, IUnknown, Interface, PCWSTR, w};
 
-/// "SECU" — required signature on every request.
 const SIGN: [u8; 4] = *b"SECU";
-/// The only `Command` value this app sends.
 const COMMAND: u32 = 0x20008;
-/// WMI's "access denied" — what a non-elevated process gets for `hpqBIntM`.
+/// Returned for `hpqBIntM` to any non-elevated process.
 const WBEM_E_ACCESS_DENIED: u32 = 0x8004_1003;
 
-/// Which `hpqBIOSInt*` method to call. The number is the reply buffer size.
+/// The number in `hpqBIOSInt*` is the size of the reply buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     /// No reply data — used for SET requests.
@@ -56,11 +52,9 @@ impl Method {
 
 #[derive(Debug)]
 pub enum Error {
-    /// A COM / WMI call failed (`what` says which).
     Com { what: &'static str, err: windows::core::Error },
-    /// The BIOS answered with a non-zero `rwReturnCode`.
+    /// Non-zero `rwReturnCode`.
     Bios(u32),
-    /// The reply didn't have the expected shape.
     BadReply(&'static str),
 }
 
@@ -107,20 +101,16 @@ impl<T> Context<T> for windows::core::Result<T> {
     }
 }
 
-/// An open connection to the BIOS interface.
 pub struct Bios {
     svc: IWbemServices,
-    /// Relative path of the `hpqBIntM` instance (e.g. `hpqBIntM.InstanceName="ACPI\\PNP0C14\\0_0"`).
+    /// e.g. `hpqBIntM.InstanceName="ACPI\\PNP0C14\\0_0"`
     path: BSTR,
-    /// `hpqBDataIn` class, spawned once per request.
     data_in_class: IWbemClassObject,
-    /// In-parameter classes of `hpqBIOSInt0` / `hpqBIOSInt128`.
     int0_params: IWbemClassObject,
     int128_params: IWbemClassObject,
 }
 
 impl Bios {
-    /// Connects to `root\wmi` and finds the first `hpqBIntM` instance.
     /// Initializes COM on the calling thread (STA).
     pub fn connect() -> Result<Self> {
         unsafe {
@@ -166,7 +156,6 @@ impl Bios {
             )
             .ctx("CoSetProxyBlanket")?;
 
-            // First hpqBIntM instance.
             let flags = WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_RETURN_IMMEDIATELY.0 | WBEM_FLAG_FORWARD_ONLY.0);
             let instances = svc
                 .CreateInstanceEnum(&BSTR::from("hpqBIntM"), flags, None)
@@ -186,7 +175,7 @@ impl Bios {
         }
     }
 
-    /// Sends one request. Returns the reply `Data` (empty for `Int0`).
+    /// Returns the reply `Data` (empty for `Int0`).
     /// A non-zero `rwReturnCode` becomes `Error::Bios`.
     pub fn call(&self, method: Method, command_type: u32, payload: &[u8]) -> Result<Vec<u8>> {
         unsafe {
@@ -293,7 +282,6 @@ impl Var {
         Var::with(VT_UNKNOWN, VARIANT_0_0_0 { punkVal: ManuallyDrop::new(Some(v)) })
     }
 
-    /// A `uint8[]` as VT_ARRAY | VT_UI1.
     fn bytes(data: &[u8]) -> Result<Var> {
         unsafe {
             let psa = SafeArrayCreateVector(VT_UI1, 0, data.len() as u32);

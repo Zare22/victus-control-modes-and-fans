@@ -1,6 +1,4 @@
 //! victus-control — performance mode and max fan for the HP Victus 16-d1xxx (board 8A25).
-//!
-//! Milestone 1: command-line only. See docs/PLAN.md.
 
 mod bios;
 mod victus;

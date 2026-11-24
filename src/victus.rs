@@ -1,7 +1,7 @@
-//! The Victus 8A25 protocol: the requests from docs/PLAN.md §3.2 and the
-//! mode recipes from §3.3. Nothing outside the `Get` / `Set` enums below can
-//! be sent, and SET requests are refused unless the board is 8A25 (or the
-//! caller passes `force`).
+//! HP Victus (board 8A25) requests and mode recipes.
+//!
+//! Only the requests in `Get` / `Set` can be sent, and SET requests are
+//! refused on other boards unless forced.
 
 use std::fmt;
 use std::thread::sleep;
@@ -56,13 +56,12 @@ impl Mode {
         }
     }
 
-    /// Maps a `0x11` mode indicator to a mode. Anything else is unknown.
     pub fn from_indicator(b: u8) -> Option<Mode> {
         Mode::ALL.into_iter().find(|m| m.indicator() == b)
     }
 
-    /// GPU power bytes for this mode (§3.3): b0 = GPU boost (on only in
-    /// Performance), b1 = Dynamic Boost on, b2/b3 kept from the BIOS.
+    /// b0 = GPU boost (on only in Performance), b1 = Dynamic Boost on,
+    /// b2/b3 kept from the BIOS.
     fn gpu_bytes(self, current: [u8; 4]) -> [u8; 4] {
         [(self == Mode::Performance) as u8, 0x01, current[2], current[3]]
     }
@@ -77,11 +76,9 @@ impl fmt::Display for Mode {
 /// GET requests (all sent with `hpqBIOSInt128`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Get {
-    /// `0x11` — fan speed (fan 0 or 1) + mode indicator.
+    /// Fan 0 or 1. The reply also carries the mode indicator.
     FanSpeed(u8),
-    /// `0x26` — max fan state.
     MaxFan,
-    /// `0x21` — GPU power bytes.
     GpuPower,
 }
 
@@ -98,11 +95,8 @@ impl Get {
 /// SET requests (all sent with `hpqBIOSInt0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Set {
-    /// `0x1A` — performance mode.
     Mode(Mode),
-    /// `0x27` — max fan on / AUTO.
     MaxFan(bool),
-    /// `0x22` — GPU power bytes.
     GpuPower([u8; 4]),
 }
 
@@ -119,7 +113,6 @@ impl Set {
 #[derive(Debug)]
 pub enum Error {
     Bios(bios::Error),
-    /// SET refused: not the verified board and no `--force`.
     WrongBoard(String),
 }
 
@@ -145,7 +138,6 @@ impl From<bios::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Fan + mode reading from one `0x11` reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FanReading {
     indicator: u8,
@@ -165,7 +157,6 @@ fn first4(data: &[u8]) -> std::result::Result<[u8; 4], bios::Error> {
         .ok_or(bios::Error::BadReply("reply shorter than 4 bytes"))
 }
 
-/// Max fan state from the `0x26` reply byte 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaxFan {
     Auto,
@@ -193,10 +184,8 @@ impl fmt::Display for MaxFan {
     }
 }
 
-/// Everything read back from the BIOS.
 #[derive(Clone, Copy, Debug)]
 pub struct State {
-    /// Raw `0x11` byte 0 (from fan 0).
     pub indicator: u8,
     pub fan_rpm: [u16; 2],
     pub max_fan: MaxFan,
@@ -216,8 +205,7 @@ pub struct Victus {
 }
 
 impl Victus {
-    /// Opens the BIOS interface. With `force`, SET requests are allowed on
-    /// boards other than 8A25.
+    /// With `force`, SET requests are allowed on boards other than 8A25.
     pub fn open(force: bool) -> Result<Victus> {
         let board = board_id();
         let allow_set = force || board == SUPPORTED_BOARD;
@@ -270,7 +258,6 @@ impl Victus {
         self.set(Set::GpuPower(gpu))
     }
 
-    /// Polls the mode indicator until it shows `mode` or `timeout` passes.
     pub fn wait_for_mode(&self, mode: Mode, timeout: Duration) -> Result<bool> {
         let start = Instant::now();
         loop {
@@ -317,34 +304,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_requests_match_plan() {
+    fn mode_request_payloads() {
         assert_eq!(Set::Mode(Mode::Quiet).request(), (0x1A, vec![0xFF, 0x03]));
         assert_eq!(Set::Mode(Mode::Default).request(), (0x1A, vec![0xFF, 0x00]));
         assert_eq!(Set::Mode(Mode::Performance).request(), (0x1A, vec![0xFF, 0x01]));
     }
 
     #[test]
-    fn max_fan_requests_match_plan() {
+    fn max_fan_request_payloads() {
         assert_eq!(Set::MaxFan(true).request(), (0x27, vec![1, 0, 0, 0]));
         assert_eq!(Set::MaxFan(false).request(), (0x27, vec![0, 0, 0, 0]));
         assert_eq!(Get::MaxFan.request(), (0x26, vec![0, 0, 0, 0]));
     }
 
     #[test]
-    fn get_requests_match_plan() {
+    fn get_request_payloads() {
         assert_eq!(Get::FanSpeed(0).request(), (0x11, vec![0]));
         assert_eq!(Get::FanSpeed(1).request(), (0x11, vec![1]));
         assert_eq!(Get::GpuPower.request(), (0x21, vec![0, 0, 0, 0]));
     }
 
     #[test]
-    fn gpu_recipes_match_plan() {
+    fn gpu_bytes_per_mode() {
         // Starting from what the BIOS leaves after a Quiet SET.
         let bios = [0x00, 0x00, 0x01, 0x00];
         assert_eq!(Mode::Quiet.gpu_bytes(bios), [0x00, 0x01, 0x01, 0x00]);
         assert_eq!(Mode::Default.gpu_bytes(bios), [0x00, 0x01, 0x01, 0x00]);
         assert_eq!(Mode::Performance.gpu_bytes(bios), [0x01, 0x01, 0x01, 0x00]);
-        // b2 / b3 are kept.
         assert_eq!(Mode::Performance.gpu_bytes([0, 0, 0x07, 0x09]), [0x01, 0x01, 0x07, 0x09]);
     }
 
@@ -359,7 +345,7 @@ mod tests {
 
     #[test]
     fn fan_reply_parses() {
-        // From the verified run: indicator 45, 0x3C, 2013 rpm.
+        // A real reply: indicator 45, constant 0x3C, 2013 rpm.
         let r = parse_fan(&[45, 0x3C, 0x07, 0xDD, 0, 0]).unwrap();
         assert_eq!(r, FanReading { indicator: 45, rpm: 2013 });
         assert!(parse_fan(&[45, 0x3C, 0x07]).is_err());

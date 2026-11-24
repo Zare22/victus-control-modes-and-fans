@@ -1,0 +1,7 @@
+/target
+
+# Local only: plans, handoffs and AI tooling stay out of the repo.
+/docs/
+HANDOFF.md
+CLAUDE.md
+.claude/

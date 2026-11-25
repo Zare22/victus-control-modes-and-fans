@@ -130,21 +130,19 @@ fn run_tray(force: bool) -> ExitCode {
 
 fn install() -> Result<(), String> {
     autostart::install()?;
-    println!("Installed to {}", autostart::installed_exe().display());
+    println!("Installed to {}", autostart::installed_exe()?.display());
     println!("Starts at logon (Task Scheduler task \"victus-control\"); the tray is running now.");
     Ok(())
 }
 
 fn uninstall() -> Result<(), String> {
     let removed_now = autostart::uninstall()?;
+    let dir = autostart::install_dir()?;
     println!("Removed the logon task.");
     if removed_now {
-        println!("Removed {}", autostart::install_dir().display());
+        println!("Removed {}, with the saved setting and the log", dir.display());
     } else {
-        println!("{} is still in use; it will be removed at the next restart.", autostart::install_dir().display());
-    }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        println!("Your setting stays in {}", std::path::Path::new(&appdata).join("victus-control").display());
+        println!("{} is still in use; it will be removed at the next restart.", dir.display());
     }
     Ok(())
 }

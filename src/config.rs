@@ -1,14 +1,18 @@
-//! The remembered setting, in `%APPDATA%\victus-control\config.toml`:
+//! The remembered setting, `config.toml` in the install folder:
 //!
 //! ```toml
 //! mode = "performance"
 //! max_fan = false
 //! ```
+//!
+//! Only admins can write there. The app runs elevated, and a folder that
+//! non-elevated code controls (such as `%APPDATA%`) could be turned into a
+//! link that redirects its writes and renames to any file.
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
 
+use crate::autostart::install_dir;
 use crate::victus::Mode;
 
 /// `None` = never chosen, so never re-applied.
@@ -18,21 +22,18 @@ pub struct Config {
     pub max_fan: Option<bool>,
 }
 
-fn dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("victus-control"))
-}
-
 impl Config {
     /// A missing or unreadable file gives the default (nothing remembered).
     pub fn load() -> Config {
-        dir()
+        install_dir()
+            .ok()
             .and_then(|d| fs::read_to_string(d.join("config.toml")).ok())
             .map(|text| Config::parse(&text))
             .unwrap_or_default()
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let dir = dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "APPDATA is not set"))?;
+        let dir = install_dir().map_err(io::Error::other)?;
         fs::create_dir_all(&dir)?;
         // Write-then-rename so a crash never leaves a half-written file.
         let tmp = dir.join("config.toml.tmp");

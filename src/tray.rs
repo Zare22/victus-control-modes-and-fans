@@ -2,7 +2,13 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM,
+};
+use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+use windows::Win32::Security::{
+    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
     GetSystemPowerStatus, POWERBROADCAST_SETTING, RegisterPowerSettingNotification, SYSTEM_POWER_STATUS,
@@ -15,9 +21,9 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuRadioItem, CreatePopupMenu, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE,
-    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, HMENU,
-    KillTimer, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    AppendMenuW, ChangeWindowMessageFilterEx, CheckMenuRadioItem, CreatePopupMenu, CreateWindowExW,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, HMENU,
+    KillTimer, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSGFLT_ALLOW,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
@@ -81,9 +87,12 @@ struct App {
 /// Returns once the user picks Exit. A second instance returns immediately.
 pub fn run(force: bool) -> Result<(), String> {
     unsafe {
-        let _single_instance = CreateMutexW(None, false, w!("Local\\victus-control-tray"));
+        let single_instance = CreateMutexW(None, false, w!("Local\\victus-control-tray"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return Ok(());
+            if single_instance.is_ok_and(owned_by_admins) {
+                return Ok(());
+            }
+            log::write("the single-instance mutex was created by a non-elevated process; starting anyway");
         }
 
         let victus = Victus::open(force).map_err(|e| e.to_string())?;
@@ -115,7 +124,12 @@ pub fn run(force: bool) -> Result<(), String> {
             None,
         )
         .map_err(|e| e.to_string())?;
-        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        TASKBAR_CREATED.store(taskbar_created, Ordering::Relaxed);
+        // Explorer isn't elevated, so Windows would otherwise drop its broadcast to this window.
+        if let Err(e) = ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, None) {
+            log::write(&format!("can't let TaskbarCreated through: {e}"));
+        }
 
         let icons = Icons::load().map_err(|e| e.to_string())?;
         let mut app = App {
@@ -153,6 +167,31 @@ pub fn run(force: bool) -> Result<(), String> {
         APP.with(|cell| cell.borrow_mut().take());
     }
     Ok(())
+}
+
+/// An elevated tray's mutex is owned by Administrators. One created first by a
+/// non-elevated process, to keep the tray from starting, is owned by the user.
+fn owned_by_admins(handle: HANDLE) -> bool {
+    let mut owner = PSID::default();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        let rc = GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        );
+        if rc != ERROR_SUCCESS {
+            return false;
+        }
+        let admins = IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool();
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        admins
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

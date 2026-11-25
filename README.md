@@ -53,8 +53,8 @@ To remove it again:
 & "C:\Program Files\victus-control\victus-control.exe" --uninstall
 ```
 
-This closes the tray, deletes the task and the Program Files folder. Your saved
-setting and the log stay (see [Files](#files)).
+This closes the tray and deletes the task and the Program Files folder,
+including the saved setting and the log (see [Files](#files)).
 
 ## Tray menu
 
@@ -107,10 +107,15 @@ Mode and fan changes made here are remembered too, just like menu choices.
 
 | What | Where |
 | --- | --- |
-| Remembered setting | `%APPDATA%\victus-control\config.toml` |
-| Log of what was set and why | `%LOCALAPPDATA%\victus-control\log.txt` (rotated at 256 KB) |
+| Remembered setting | `C:\Program Files\victus-control\config.toml` |
+| Log of what was set and why | `C:\Program Files\victus-control\log.txt` (rotated at 256 KB) |
 
-`config.toml` is plain text and can be edited by hand:
+Both live next to the exe, where only administrators can write. The app runs
+as administrator, so it never writes to a folder that other programs could
+tamper with.
+
+`config.toml` is plain text and can be edited by hand, from an editor started
+as administrator:
 
 ```toml
 mode = "performance"

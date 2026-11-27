@@ -36,9 +36,13 @@ impl Config {
         let dir = install_dir().map_err(io::Error::other)?;
         fs::create_dir_all(&dir)?;
         // Write-then-rename so a crash never leaves a half-written file.
-        let tmp = dir.join("config.toml.tmp");
+        let tmp = dir.join(format!("config.toml.{}.tmp", std::process::id()));
         fs::write(&tmp, self.to_text())?;
-        fs::rename(tmp, dir.join("config.toml"))
+        if let Err(e) = fs::rename(&tmp, dir.join("config.toml")) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn parse(text: &str) -> Config {

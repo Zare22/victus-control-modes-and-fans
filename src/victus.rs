@@ -216,6 +216,10 @@ impl Victus {
         &self.board
     }
 
+    pub fn is_supported_board(&self) -> bool {
+        self.board == SUPPORTED_BOARD
+    }
+
     fn get(&self, req: Get) -> Result<Vec<u8>> {
         let (ty, payload) = req.request();
         Ok(self.bios.call(Method::Int128, ty, &payload)?)

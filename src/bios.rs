@@ -12,8 +12,8 @@ use windows::Win32::System::Com::{
     RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, SAFEARRAY,
 };
 use windows::Win32::System::Ole::{
-    SafeArrayAccessData, SafeArrayCreateVector, SafeArrayGetLBound, SafeArrayGetUBound,
-    SafeArrayUnaccessData,
+    SafeArrayAccessData, SafeArrayCreateVector, SafeArrayGetDim, SafeArrayGetElemsize,
+    SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{
@@ -29,6 +29,8 @@ use windows::core::{BSTR, IUnknown, Interface, PCWSTR, w};
 
 const SIGN: [u8; 4] = *b"SECU";
 const COMMAND: u32 = 0x20008;
+/// Largest HP BIOS WMI reply method is `hpqBIOSInt4096`.
+const MAX_REPLY_BYTES: usize = 4096;
 /// Returned for `hpqBIntM` to any non-elevated process.
 const WBEM_E_ACCESS_DENIED: u32 = 0x8004_1003;
 
@@ -333,17 +335,53 @@ impl Var {
         }
         unsafe {
             let psa: *mut SAFEARRAY = self.0.Anonymous.Anonymous.Anonymous.parray;
+            if psa.is_null() {
+                return Err(Error::BadReply("null byte array"));
+            }
+            if SafeArrayGetDim(psa) != 1 || SafeArrayGetElemsize(psa) != 1 {
+                return Err(Error::BadReply("expected a 1D byte array"));
+            }
             let lo = SafeArrayGetLBound(psa, 1).ctx("SafeArrayGetLBound")?;
             let hi = SafeArrayGetUBound(psa, 1).ctx("SafeArrayGetUBound")?;
-            let len = (hi - lo + 1).max(0) as usize;
+            let len = safearray_len(lo, hi)?;
             let mut out = vec![0u8; len];
             if len > 0 {
                 let mut p = std::ptr::null_mut();
                 SafeArrayAccessData(psa, &mut p).ctx("SafeArrayAccessData")?;
+                if p.is_null() {
+                    let _ = SafeArrayUnaccessData(psa);
+                    return Err(Error::BadReply("null byte array data"));
+                }
                 std::ptr::copy_nonoverlapping(p.cast::<u8>(), out.as_mut_ptr(), len);
                 SafeArrayUnaccessData(psa).ctx("SafeArrayUnaccessData")?;
             }
             Ok(out)
         }
+    }
+}
+
+fn safearray_len(lo: i32, hi: i32) -> Result<usize> {
+    if hi < lo {
+        return Ok(0);
+    }
+    let count = i64::from(hi) - i64::from(lo) + 1;
+    if count > MAX_REPLY_BYTES as i64 {
+        return Err(Error::BadReply("byte array too large"));
+    }
+    Ok(count as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safearray_len_handles_empty_normal_and_overflow_bounds() {
+        assert_eq!(safearray_len(0, -1).unwrap(), 0);
+        assert_eq!(safearray_len(0, 127).unwrap(), 128);
+        assert_eq!(safearray_len(-5, 4).unwrap(), 10);
+        assert_eq!(safearray_len(0, MAX_REPLY_BYTES as i32 - 1).unwrap(), MAX_REPLY_BYTES);
+        assert!(safearray_len(0, MAX_REPLY_BYTES as i32).is_err());
+        assert!(safearray_len(i32::MIN, i32::MAX).is_err());
     }
 }

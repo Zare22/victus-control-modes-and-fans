@@ -5,4 +5,9 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
     // The execution level comes from app.manifest.
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
+    // Resolve static DLL imports only from System32 (LOAD_LIBRARY_SEARCH_SYSTEM32).
+    println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    if matches!(std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(), Ok("x86_64" | "x86")) {
+        println!("cargo:rustc-link-arg-bins=/CETCOMPAT");
+    }
 }

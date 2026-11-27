@@ -7,7 +7,7 @@ HP BIOS directly through WMI, the same interface Gaming Hub uses.
 - **Performance mode:** Quiet, Default or Performance
 - **Max fan:** on, or back to AUTO
 - Remembers your choice and puts it back at logon, on plug-in and on wake
-- One ~300 KB exe, no installer, no services; about 1.6 MB of RAM and no CPU while idle
+- One ~425 KB standalone exe, no installer, no services; about 1.6 MB of RAM and no CPU while idle
 
 The tray icon shows the current mode: a snail for Quiet, a rabbit for Default
 and a leopard for Performance.
@@ -15,8 +15,9 @@ and a leopard for Performance.
 ## Supported hardware
 
 Only tested on the **HP Victus 16-d1xxx (board ID 8A25)**. On any other board
-the app reads the state but refuses to change anything, unless you pass
-`--force`. Other HP Victus and OMEN models may use the same BIOS interface with
+the app reads the state but refuses to install or change anything (pass
+`--force` with CLI/tray commands to override; `--install` refuses unsupported
+boards). Other HP Victus and OMEN models may use the same BIOS interface with
 different values; `--force` on an unverified board is at your own risk.
 
 You can see your board ID with:

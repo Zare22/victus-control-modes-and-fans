@@ -3,18 +3,25 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError,
+    HANDLE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, WPARAM,
 };
-use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::{
-    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid,
+    CreateWellKnownSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
+    WinBuiltinAdministratorsSid,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
     GetSystemPowerStatus, POWERBROADCAST_SETTING, RegisterPowerSettingNotification, SYSTEM_POWER_STATUS,
 };
 use windows::Win32::System::SystemServices::{GUID_ACDC_POWER_SOURCE, GUID_CONSOLE_DISPLAY_STATE};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexW,
+    CreatePrivateNamespaceW, DeleteBoundaryDescriptor, OpenPrivateNamespaceW,
+};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_WARNING, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFY_ICON_INFOTIP_FLAGS,
@@ -86,15 +93,10 @@ struct App {
 
 /// Returns once the user picks Exit. A second instance returns immediately.
 pub fn run(force: bool) -> Result<(), String> {
+    let Some(_single_instance) = SingleInstance::acquire()? else {
+        return Ok(());
+    };
     unsafe {
-        let single_instance = CreateMutexW(None, false, w!("Local\\victus-control-tray"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            if single_instance.is_ok_and(owned_by_admins) {
-                return Ok(());
-            }
-            log::write("the single-instance mutex was created by a non-elevated process; starting anyway");
-        }
-
         let victus = Victus::open(force).map_err(|e| e.to_string())?;
         let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         let class = w!("victus-control");
@@ -169,28 +171,99 @@ pub fn run(force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// An elevated tray's mutex is owned by Administrators. One created first by a
-/// non-elevated process, to keep the tray from starting, is owned by the user.
-fn owned_by_admins(handle: HANDLE) -> bool {
-    let mut owner = PSID::default();
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        let rc = GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            Some(&mut sd),
-        );
-        if rc != ERROR_SUCCESS {
-            return false;
+/// Holds a mutex inside an Administrators-only private object namespace so
+/// non-elevated processes cannot squat on or bypass the single-instance check.
+struct SingleInstance {
+    mutex: HANDLE,
+    namespace: HANDLE,
+    boundary: HANDLE,
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.mutex.is_invalid() {
+                let _ = CloseHandle(self.mutex);
+            }
+            if !self.namespace.is_invalid() {
+                let _ = ClosePrivateNamespace(self.namespace, 0);
+            }
+            if !self.boundary.is_invalid() {
+                DeleteBoundaryDescriptor(self.boundary);
+            }
         }
-        let admins = IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool();
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-        admins
+    }
+}
+
+impl SingleInstance {
+    fn acquire() -> Result<Option<Self>, String> {
+        Self::acquire_named(w!("victus-control-boundary"), w!("victus-control"), w!("victus-control\\tray"))
+    }
+
+    fn acquire_named(boundary_name: PCWSTR, alias: PCWSTR, mutex_name: PCWSTR) -> Result<Option<Self>, String> {
+        unsafe {
+            let mut sid_buf = [0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<u32>())];
+            let mut sid_len = std::mem::size_of_val(&sid_buf) as u32;
+            let admins = PSID(sid_buf.as_mut_ptr().cast());
+            CreateWellKnownSid(WinBuiltinAdministratorsSid, None, Some(admins), &mut sid_len)
+                .map_err(|e| format!("can't create Administrators SID: {e}"))?;
+
+            let mut boundary = CreateBoundaryDescriptorW(boundary_name, 0);
+            if boundary.is_invalid() {
+                return Err(format!("CreateBoundaryDescriptorW failed: {}", windows::core::Error::from_thread()));
+            }
+            if let Err(e) = AddSIDToBoundaryDescriptor(&mut boundary, admins) {
+                DeleteBoundaryDescriptor(boundary);
+                return Err(format!("AddSIDToBoundaryDescriptor failed: {e}"));
+            }
+
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            if let Err(e) = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w!("D:(A;;GA;;;SY)(A;;GA;;;BA)"),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            ) {
+                DeleteBoundaryDescriptor(boundary);
+                return Err(format!("can't build namespace ACL: {e}"));
+            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd.0,
+                bInheritHandle: false.into(),
+            };
+            let mut namespace = CreatePrivateNamespaceW(Some(&sa), boundary.0, alias);
+            let mut err = GetLastError();
+            if namespace.is_invalid() && err == ERROR_ALREADY_EXISTS {
+                namespace = OpenPrivateNamespaceW(boundary.0, alias);
+                err = GetLastError();
+                if namespace.is_invalid() && matches!(err, ERROR_PATH_NOT_FOUND | ERROR_FILE_NOT_FOUND) {
+                    // The previous instance exited between Create and Open.
+                    namespace = CreatePrivateNamespaceW(Some(&sa), boundary.0, alias);
+                    err = GetLastError();
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+
+            if namespace.is_invalid() {
+                DeleteBoundaryDescriptor(boundary);
+                return Err(format!("can't open private namespace: {}", windows::core::Error::from(err)));
+            }
+
+            let mutex = match CreateMutexW(None, false, mutex_name) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = ClosePrivateNamespace(namespace, 0);
+                    DeleteBoundaryDescriptor(boundary);
+                    return Err(format!("CreateMutexW failed: {e}"));
+                }
+            };
+            let guard = SingleInstance { mutex, namespace, boundary };
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                return Ok(None);
+            }
+            Ok(Some(guard))
+        }
     }
 }
 
@@ -227,15 +300,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     with_app(|app| app.schedule_reapply("resume"));
                 }
                 PBT_POWERSETTINGCHANGE => {
-                    let setting = unsafe { &*(lparam.0 as *const POWERBROADCAST_SETTING) };
-                    if setting.DataLength >= 4 {
-                        let value = unsafe { std::ptr::read_unaligned(setting.Data.as_ptr().cast::<u32>()) };
-                        if setting.PowerSetting == GUID_ACDC_POWER_SOURCE {
-                            // 0 = AC, 1 = battery, 2 = short-term source (UPS).
-                            with_app(|app| app.power_source_changed(value == 0));
-                        } else if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
-                            // 0 = off, 1 = on, 2 = dimmed.
-                            with_app(|app| app.display_changed(value != 0));
+                    let ptr = lparam.0 as *const POWERBROADCAST_SETTING;
+                    if !ptr.is_null() {
+                        unsafe {
+                            let data_len = std::ptr::addr_of!((*ptr).DataLength).read_unaligned();
+                            if data_len >= size_of::<u32>() as u32 {
+                                let guid = std::ptr::addr_of!((*ptr).PowerSetting).read_unaligned();
+                                let value = std::ptr::addr_of!((*ptr).Data).cast::<u32>().read_unaligned();
+                                if guid == GUID_ACDC_POWER_SOURCE {
+                                    // 0 = AC, 1 = battery, 2 = short-term source (UPS).
+                                    with_app(|app| app.power_source_changed(value == 0));
+                                } else if guid == GUID_CONSOLE_DISPLAY_STATE {
+                                    // 0 = off, 1 = on, 2 = dimmed.
+                                    with_app(|app| app.display_changed(value != 0));
+                                }
+                            }
                         }
                     }
                 }
@@ -643,5 +722,25 @@ mod tests {
         assert_eq!(buf, [b'a' as u16, b'b' as u16, 0, 0xFFFF]);
         copy_wide(&mut buf, "abcdef");
         assert_eq!(buf, [b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+    }
+
+    #[test]
+    fn single_instance_blocks_second_acquire_until_dropped() {
+        // Windows binds each private-namespace alias per process, so a second
+        // handle in the same test process uses a distinct alias for the same boundary.
+        let b = w!("victus-control-test-boundary");
+        let first = SingleInstance::acquire_named(b, w!("victus-control-test-1"), w!("victus-control-test-1\\tray")).unwrap();
+        assert!(first.is_some());
+        assert!(
+            SingleInstance::acquire_named(b, w!("victus-control-test-2"), w!("victus-control-test-2\\tray"))
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            SingleInstance::acquire_named(b, w!("victus-control-test-1"), w!("victus-control-test-1\\tray"))
+                .unwrap()
+                .is_some()
+        );
     }
 }

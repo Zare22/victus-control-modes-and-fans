@@ -11,6 +11,7 @@ mod victus;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
 
@@ -50,8 +51,8 @@ fn parse_args(args: &[String]) -> Option<(Action, bool)> {
         ["mode", m] => Action::Bios(Command::Mode(Mode::parse(m)?)),
         ["fan", f] if f.eq_ignore_ascii_case("max") => Action::Bios(Command::Fan(true)),
         ["fan", f] if f.eq_ignore_ascii_case("auto") => Action::Bios(Command::Fan(false)),
-        ["--install"] => Action::Install,
-        ["--uninstall"] => Action::Uninstall,
+        ["--install"] if !force => Action::Install,
+        ["--uninstall"] if !force => Action::Uninstall,
         _ => return None,
     };
     Some((action, force))
@@ -129,6 +130,14 @@ fn run_tray(force: bool) -> ExitCode {
 }
 
 fn install() -> Result<(), String> {
+    let v = Victus::open(false).map_err(|e| e.to_string())?;
+    if !v.is_supported_board() {
+        return Err(format!(
+            "board is '{}', not {}: refusing to install on an unverified board",
+            v.board(),
+            victus::SUPPORTED_BOARD
+        ));
+    }
     autostart::install()?;
     println!("Installed to {}", autostart::installed_exe()?.display());
     println!("Starts at logon (Task Scheduler task \"victus-control\"); the tray is running now.");
@@ -148,6 +157,9 @@ fn uninstall() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    unsafe {
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((action, force)) = parse_args(&args) else {
         eprintln!("{USAGE}");
@@ -165,5 +177,25 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Option<(Action, bool)> {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        parse_args(&owned)
+    }
+
+    #[test]
+    fn parse_args_rejects_force_with_install_or_uninstall() {
+        assert!(matches!(parse(&["--install"]), Some((Action::Install, false))));
+        assert!(matches!(parse(&["--uninstall"]), Some((Action::Uninstall, false))));
+        assert!(parse(&["--install", "--force"]).is_none());
+        assert!(parse(&["--uninstall", "--force"]).is_none());
+        assert!(matches!(parse(&["mode", "quiet", "--force"]), Some((Action::Bios(Command::Mode(Mode::Quiet)), true))));
+        assert!(matches!(parse(&["--force"]), Some((Action::Tray, true))));
     }
 }
